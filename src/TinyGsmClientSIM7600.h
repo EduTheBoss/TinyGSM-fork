@@ -1087,35 +1087,51 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     sendAT(GF("+CIPRXGET=2,"), mux, ',', (uint16_t)size);
     if (waitResponse(GF("+CIPRXGET:")) != 1) { return 0; }
 #endif
-    streamSkipUntil(',');  // Skip Rx mode 2/normal or 3/HEX
-    streamSkipUntil(',');  // Skip mux/cid (connecion id)
+    streamSkipUntil(',');  // Skip Rx mode
+    streamSkipUntil(',');  // Skip mux
     int16_t len_requested = streamGetIntBefore(',');
-    //  ^^ Requested number of data bytes (1-1460 bytes)to be read
     int16_t len_confirmed = streamGetIntBefore('\n');
-    // ^^ The data length which not read in the buffer
+    
+    // === FIX START: GLOBAL TIMEOUT ===
+    // Instead of waiting 1s per byte (which can add up to 500s),
+    // we set a hard deadline for the entire chunk.
+    uint32_t batchStart = millis();
+    uint32_t batchTimeout = 5000; // 5 seconds headroom (User requested)
+
     for (int i = 0; i < len_requested; i++) {
-      uint32_t startMillis = millis();
+      
+      // 1. Check if the entire batch operation has taken too long
+      if (millis() - batchStart > batchTimeout) {
+          DBG("### Rx Global Timeout (Batch took > 5s)");
+          break; // Stop reading, but don't crash. Return what we have.
+      }
+
+      uint32_t charStart = millis();
 #ifdef TINY_GSM_USE_HEX
       while (stream.available() < 2 &&
-             (millis() - startMillis < sockets[mux]->_timeout)) {
+             (millis() - charStart < sockets[mux]->_timeout)) {
         TINY_GSM_YIELD();
       }
-      char buf[4] = {
-          0,
-      };
+      // If individual char times out, we still break to avoid bad data
+      if (stream.available() < 2) break; 
+      
+      char buf[4] = { 0, };
       buf[0] = stream.read();
       buf[1] = stream.read();
       char c = strtol(buf, NULL, 16);
 #else
-      while (!stream.available() && (millis() - startMillis < sockets[mux]->_timeout)) {
+      while (!stream.available() && (millis() - charStart < sockets[mux]->_timeout)) {
         TINY_GSM_YIELD();
       }
+      // If individual char times out, we still break
+      if (!stream.available()) break;
+
       char c = stream.read();
 #endif
       sockets[mux]->rx.put(c);
     }
-    // DBG("### READ:", len_requested, "from", mux);
-    // sockets[mux]->sock_available = modemGetAvailable(mux);
+    // === FIX END ===
+
     sockets[mux]->sock_available = len_confirmed;
     waitResponse();
     return len_requested;
