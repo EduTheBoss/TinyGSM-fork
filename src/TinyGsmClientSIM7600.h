@@ -16,6 +16,8 @@
 #define TINY_GSM_BUFFER_READ_AND_CHECK_SIZE
 #define TINY_GSM_MODEM_HAS_NETWORK_MODE
 
+#include <esp_task_wdt.h> // Added for Watchdog/Flow Control fixes
+
 #include "TinyGsmBattery.tpp"
 #include "TinyGsmCalling.tpp"
 #include "TinyGsmGPRS.tpp"
@@ -194,6 +196,39 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     void stop() override {
       stop(15000L);
     }
+
+    // =================================================================
+    // FIX: INTEGRATED FLOW CONTROL (THE FUNNEL FIX)
+    // We override write() to slow down transmission (50ms delay).
+    // This allows the modem's internal TX buffer to drain into the network.
+    // =================================================================
+    size_t write(const uint8_t *buf, size_t size) override {
+        const size_t SAFE_TX_SIZE = 256; 
+        size_t totalWritten = 0;
+        
+        for (size_t i = 0; i < size; i += SAFE_TX_SIZE) {
+            size_t chunk = (size - i) > SAFE_TX_SIZE ? SAFE_TX_SIZE : (size - i);
+            
+            // Call the parent GsmClient write
+            size_t sent = GsmClient::write(buf + i, chunk);
+            totalWritten += sent;
+            
+            // Feed watchdog
+            #ifdef ESP32
+            esp_task_wdt_reset();
+            #endif
+            
+            // CRITICAL DELAY: 100ms pause to let the modem clear its RAM
+            delay(100); 
+            
+            if (sent != chunk) break;
+            yield(); 
+        }
+        return totalWritten;
+    }
+    
+    // Ensure single byte write uses the base implementation
+    using GsmClient::write;
 
     /*
      * Extended API
@@ -1078,6 +1113,10 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     return streamGetIntBefore('\n');
   }
 
+  // =================================================================
+  // FIX: READ TIMEOUT PROTECTION (THE CRASH FIX)
+  // Prevents 90s Watchdog crash when modem stalls during stop()/dumpBuffer()
+  // =================================================================
   size_t modemRead(size_t size, uint8_t mux) {
     if (!sockets[mux]) return 0;
 #ifdef TINY_GSM_USE_HEX
@@ -1092,18 +1131,14 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     int16_t len_requested = streamGetIntBefore(',');
     int16_t len_confirmed = streamGetIntBefore('\n');
     
-    // === FIX START: GLOBAL TIMEOUT ===
-    // Instead of waiting 1s per byte (which can add up to 500s),
-    // we set a hard deadline for the entire chunk.
+    // Global Timeout to prevent Watchdog Crash
     uint32_t batchStart = millis();
-    uint32_t batchTimeout = 5000; // 5 seconds headroom (User requested)
+    uint32_t batchTimeout = 3000; // 3 seconds max wait for this batch
 
     for (int i = 0; i < len_requested; i++) {
-      
-      // 1. Check if the entire batch operation has taken too long
+      // If the modem promised data but isn't sending it, abort after 3s.
       if (millis() - batchStart > batchTimeout) {
-          DBG("### Rx Global Timeout (Batch took > 5s)");
-          break; // Stop reading, but don't crash. Return what we have.
+          break; // Break the loop, return what we have, and let the system continue
       }
 
       uint32_t charStart = millis();
@@ -1112,8 +1147,7 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
              (millis() - charStart < sockets[mux]->_timeout)) {
         TINY_GSM_YIELD();
       }
-      // If individual char times out, we still break to avoid bad data
-      if (stream.available() < 2) break; 
+      if (stream.available() < 2) break; // Individual timeout
       
       char buf[4] = { 0, };
       buf[0] = stream.read();
@@ -1123,14 +1157,12 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
       while (!stream.available() && (millis() - charStart < sockets[mux]->_timeout)) {
         TINY_GSM_YIELD();
       }
-      // If individual char times out, we still break
-      if (!stream.available()) break;
+      if (!stream.available()) break; // Individual timeout
 
       char c = stream.read();
 #endif
       sockets[mux]->rx.put(c);
     }
-    // === FIX END ===
 
     sockets[mux]->sock_available = len_confirmed;
     waitResponse();
