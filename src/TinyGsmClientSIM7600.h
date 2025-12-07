@@ -191,7 +191,9 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
       dumpModemBuffer(maxWaitMs);
       at->sendAT(GF("+CIPCLOSE="), mux);
       sock_connected = false;
-      at->waitResponse();
+      // [CRITICAL FIX] Add timeout to waitResponse to prevent indefinite blocking
+      // on dead connections. 3 seconds is plenty for a responsive modem.
+      at->waitResponse(3000L);
     }
     void stop() override {
       stop(15000L);
