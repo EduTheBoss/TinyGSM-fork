@@ -205,6 +205,12 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     // This allows the modem's internal TX buffer to drain into the network.
     // =================================================================
     size_t write(const uint8_t *buf, size_t size) override {
+        // [CRITICAL FIX] Fast-fail if socket is not connected
+        // Prevents 90s blocking when trying to write to dead connection
+        if (!sock_connected) {
+            return 0;
+        }
+        
         const size_t SAFE_TX_SIZE = 256; 
         size_t totalWritten = 0;
         
@@ -1105,10 +1111,12 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
 
   int16_t modemSend(const void* buff, size_t len, uint8_t mux) {
     sendAT(GF("+CIPSEND="), mux, ',', (uint16_t)len);
-    if (waitResponse(GF(">")) != 1) { return 0; }
+    // [CRITICAL FIX] Add 3s timeout to prevent 90s blocking on dead connections
+    if (waitResponse(3000L, GF(">")) != 1) { return 0; }
     stream.write(reinterpret_cast<const uint8_t*>(buff), len);
     stream.flush();
-    if (waitResponse(GF(GSM_NL "+CIPSEND:")) != 1) { return 0; }
+    // [CRITICAL FIX] Add 3s timeout - on healthy connection response is <500ms
+    if (waitResponse(3000L, GF(GSM_NL "+CIPSEND:")) != 1) { return 0; }
     streamSkipUntil(',');  // Skip mux
     streamSkipUntil(',');  // Skip requested bytes to send
     // TODO(?):  make sure requested and confirmed bytes match
