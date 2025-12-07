@@ -226,8 +226,9 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
             esp_task_wdt_reset();
             #endif
             
-            // CRITICAL DELAY: 100ms pause to let the modem clear its RAM
-            delay(100); 
+            // [TEMPORARY FIX] Reduce delay from 100ms to 10ms to prevent timeout accumulation
+            // On dead connections, we want to fail fast, not waste 600+ms in delays
+            delay(10); 
             
             if (sent != chunk) break;
             yield(); 
@@ -1110,17 +1111,54 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
   }
 
   int16_t modemSend(const void* buff, size_t len, uint8_t mux) {
+    // [CRITICAL FIX] Add overall timeout for entire send operation
+    unsigned long sendStart = millis();
+    unsigned long sendMaxTime = 5000; // 5 seconds max for entire operation
+    
     sendAT(GF("+CIPSEND="), mux, ',', (uint16_t)len);
     // [CRITICAL FIX] Add 3s timeout to prevent 90s blocking on dead connections
     if (waitResponse(3000L, GF(">")) != 1) { return 0; }
+    
+    // Check if we've exceeded overall timeout
+    if (millis() - sendStart > sendMaxTime) {
+      DBG("modemSend: Overall timeout exceeded after waitResponse");
+      return 0;
+    }
+    
     stream.write(reinterpret_cast<const uint8_t*>(buff), len);
     stream.flush();
+    
+    // Check timeout again
+    if (millis() - sendStart > sendMaxTime) {
+      DBG("modemSend: Overall timeout exceeded after stream.write");
+      return 0;
+    }
+    
     // [CRITICAL FIX] Add 3s timeout - on healthy connection response is <500ms
     if (waitResponse(3000L, GF(GSM_NL "+CIPSEND:")) != 1) { return 0; }
+    
+    // [CRITICAL FIX] Add timeout protection for stream parsing
     streamSkipUntil(',');  // Skip mux
+    if (millis() - sendStart > sendMaxTime) {
+      DBG("modemSend: Overall timeout exceeded in streamSkipUntil");
+      return 0;
+    }
+    
     streamSkipUntil(',');  // Skip requested bytes to send
+    if (millis() - sendStart > sendMaxTime) {
+      DBG("modemSend: Overall timeout exceeded in streamSkipUntil #2");
+      return 0;
+    }
+    
     // TODO(?):  make sure requested and confirmed bytes match
-    return streamGetIntBefore('\n');
+    int result = streamGetIntBefore('\n');
+    
+    if (millis() - sendStart > sendMaxTime) {
+      DBG("modemSend: Overall timeout exceeded - operation took too long");
+      return 0;
+    }
+    
+    return result;
   }
 
   // =================================================================
