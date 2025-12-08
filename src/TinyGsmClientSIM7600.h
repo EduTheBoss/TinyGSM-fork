@@ -1164,10 +1164,19 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
       return 0;
     }
     
+    // [CRITICAL FIX] Temporarily reduce Stream timeout to prevent blocking
+    // If modem is dead, these parsing functions will block for Stream timeout
+    // We need them to fail fast so we can return 0 and propagate error upward
+    unsigned long oldTimeout = stream.getTimeout();
+    stream.setTimeout(500); // 500ms max for parsing - healthy modem responds in <50ms
+    
     streamSkipUntil(',');  // Skip mux
     streamSkipUntil(',');  // Skip requested bytes to send
     // TODO(?):  make sure requested and confirmed bytes match
     int result = streamGetIntBefore('\n');
+    
+    // Restore original timeout
+    stream.setTimeout(oldTimeout);
     
     return result;
   }

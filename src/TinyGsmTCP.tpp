@@ -293,10 +293,34 @@ class TinyGsmTCP {
 #if defined TINY_GSM_BUFFER_READ_AND_CHECK_SIZE || defined TINY_GSM_BUFFER_READ_NO_CHECK
       TINY_GSM_YIELD();
       uint32_t startMillis = millis();
-      while (sock_available > 0 && (millis() - startMillis < maxWaitMs)) {
+      
+      // [CRITICAL FIX] Limit to prevent infinite loop on dead connection
+      // If sock_available doesn't decrease, we could loop forever
+      int maxIterations = 100; // Safety limit
+      int iteration = 0;
+      uint16_t lastAvailable = sock_available;
+      
+      while (sock_available > 0 && (millis() - startMillis < maxWaitMs) && iteration < maxIterations) {
+        iteration++;
+        
+        // Feed watchdog during buffer dump
+        esp_task_wdt_reset();
+        
         rx.clear();
         at->modemRead(TinyGsmMin((uint16_t)rx.free(), sock_available), mux);
+        
+        // If sock_available didn't decrease, modem is dead - bail immediately
+        if (sock_available == lastAvailable) {
+          DBG("dumpModemBuffer: sock_available stuck at", sock_available, "- aborting");
+          break;
+        }
+        lastAvailable = sock_available;
       }
+      
+      if (iteration >= maxIterations) {
+        DBG("dumpModemBuffer: Hit iteration limit - possible dead connection");
+      }
+      
       rx.clear();
       at->streamClear();
 
