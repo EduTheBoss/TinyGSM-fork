@@ -214,21 +214,36 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
         const size_t SAFE_TX_SIZE = 256; 
         size_t totalWritten = 0;
         
+        // [CRITICAL FIX] Track start time to prevent infinite blocking
+        unsigned long writeStart = millis();
+        unsigned long writeMaxTime = 3000; // 3s max for entire write operation
+        
         for (size_t i = 0; i < size; i += SAFE_TX_SIZE) {
+            // Bail if we're taking too long
+            if (millis() - writeStart > writeMaxTime) {
+                DBG("write: Timeout exceeded, aborting");
+                break;
+            }
+            
             size_t chunk = (size - i) > SAFE_TX_SIZE ? SAFE_TX_SIZE : (size - i);
             
             // Call the parent GsmClient write
             size_t sent = GsmClient::write(buf + i, chunk);
             totalWritten += sent;
             
+            // [CRITICAL FIX] If send failed (returned 0), connection is dead - abort immediately
+            if (sent == 0) {
+                DBG("write: Send failed (0 bytes) - aborting");
+                break;
+            }
+            
             // Feed watchdog
             #ifdef ESP32
             esp_task_wdt_reset();
             #endif
             
-            // [TEMPORARY FIX] Reduce delay from 100ms to 10ms to prevent timeout accumulation
-            // On dead connections, we want to fail fast, not waste 600+ms in delays
-            delay(10); 
+            // [CRITICAL FIX] Minimal delay - fail fast on errors
+            delay(5); 
             
             if (sent != chunk) break;
             yield(); 
@@ -1111,42 +1126,41 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
   }
 
   int16_t modemSend(const void* buff, size_t len, uint8_t mux) {
-    // [CRITICAL FIX] Add overall timeout for entire send operation
+    // [CRITICAL FIX] Very aggressive timeout - fail fast on dead connections
     unsigned long sendStart = millis();
-    unsigned long sendMaxTime = 5000; // 5 seconds max for entire operation
+    unsigned long sendMaxTime = 2000; // 2 seconds max TOTAL - healthy sends are <500ms
     
     sendAT(GF("+CIPSEND="), mux, ',', (uint16_t)len);
-    // [CRITICAL FIX] Add 3s timeout to prevent 90s blocking on dead connections
-    if (waitResponse(3000L, GF(">")) != 1) { 
-      DBG("modemSend: Failed to get prompt");
+    // [CRITICAL FIX] 1s timeout for prompt - healthy connections respond in <100ms
+    if (waitResponse(1000L, GF(">")) != 1) { 
+      DBG("modemSend: No prompt - dead connection");
       return 0;
     }
     
-    // Check if we've exceeded overall timeout
+    // Bail if already over time
     if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Overall timeout exceeded after waitResponse");
+      DBG("modemSend: Timeout after prompt wait");
       return 0;
     }
     
     stream.write(reinterpret_cast<const uint8_t*>(buff), len);
     stream.flush();
     
-    // Check timeout again
+    // Bail if write took too long
     if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Overall timeout exceeded after stream.write");
+      DBG("modemSend: Timeout after stream write");
       return 0;
     }
     
-    // [CRITICAL FIX] Add 3s timeout - on healthy connection response is <500ms
-    if (waitResponse(3000L, GF(GSM_NL "+CIPSEND:")) != 1) {
-      DBG("modemSend: Failed to get CIPSEND confirmation");
+    // [CRITICAL FIX] 1s timeout for confirmation - healthy connections respond in <200ms
+    if (waitResponse(1000L, GF(GSM_NL "+CIPSEND:")) != 1) {
+      DBG("modemSend: No confirmation - dead connection");
       return 0;
     }
     
-    // [CRITICAL FIX] Don't parse response if we're out of time or waitResponse failed
-    // The parsing functions (streamSkipUntil, streamGetIntBefore) can block for 90s!
+    // Final timeout check before parsing
     if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Overall timeout - skipping response parsing");
+      DBG("modemSend: Timeout before parsing");
       return 0;
     }
     
