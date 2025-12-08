@@ -1117,7 +1117,10 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     
     sendAT(GF("+CIPSEND="), mux, ',', (uint16_t)len);
     // [CRITICAL FIX] Add 3s timeout to prevent 90s blocking on dead connections
-    if (waitResponse(3000L, GF(">")) != 1) { return 0; }
+    if (waitResponse(3000L, GF(">")) != 1) { 
+      DBG("modemSend: Failed to get prompt");
+      return 0;
+    }
     
     // Check if we've exceeded overall timeout
     if (millis() - sendStart > sendMaxTime) {
@@ -1135,28 +1138,22 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     }
     
     // [CRITICAL FIX] Add 3s timeout - on healthy connection response is <500ms
-    if (waitResponse(3000L, GF(GSM_NL "+CIPSEND:")) != 1) { return 0; }
+    if (waitResponse(3000L, GF(GSM_NL "+CIPSEND:")) != 1) {
+      DBG("modemSend: Failed to get CIPSEND confirmation");
+      return 0;
+    }
     
-    // [CRITICAL FIX] Add timeout protection for stream parsing
+    // [CRITICAL FIX] Don't parse response if we're out of time or waitResponse failed
+    // The parsing functions (streamSkipUntil, streamGetIntBefore) can block for 90s!
+    if (millis() - sendStart > sendMaxTime) {
+      DBG("modemSend: Overall timeout - skipping response parsing");
+      return 0;
+    }
+    
     streamSkipUntil(',');  // Skip mux
-    if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Overall timeout exceeded in streamSkipUntil");
-      return 0;
-    }
-    
     streamSkipUntil(',');  // Skip requested bytes to send
-    if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Overall timeout exceeded in streamSkipUntil #2");
-      return 0;
-    }
-    
     // TODO(?):  make sure requested and confirmed bytes match
     int result = streamGetIntBefore('\n');
-    
-    if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Overall timeout exceeded - operation took too long");
-      return 0;
-    }
     
     return result;
   }
