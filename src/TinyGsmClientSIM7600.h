@@ -191,9 +191,7 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
       dumpModemBuffer(maxWaitMs);
       at->sendAT(GF("+CIPCLOSE="), mux);
       sock_connected = false;
-      // [CRITICAL FIX] Add timeout to waitResponse to prevent indefinite blocking
-      // on dead connections. 3 seconds is plenty for a responsive modem.
-      at->waitResponse(3000L);
+      at->waitResponse();
     }
     void stop() override {
       stop(15000L);
@@ -205,45 +203,23 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     // This allows the modem's internal TX buffer to drain into the network.
     // =================================================================
     size_t write(const uint8_t *buf, size_t size) override {
-        // [CRITICAL FIX] Fast-fail if socket is not connected
-        // Prevents 90s blocking when trying to write to dead connection
-        if (!sock_connected) {
-            return 0;
-        }
-        
         const size_t SAFE_TX_SIZE = 256; 
         size_t totalWritten = 0;
         
-        // [CRITICAL FIX] Track start time to prevent infinite blocking
-        unsigned long writeStart = millis();
-        unsigned long writeMaxTime = 3000; // 3s max for entire write operation
-        
         for (size_t i = 0; i < size; i += SAFE_TX_SIZE) {
-            // Bail if we're taking too long
-            if (millis() - writeStart > writeMaxTime) {
-                DBG("write: Timeout exceeded, aborting");
-                break;
-            }
-            
             size_t chunk = (size - i) > SAFE_TX_SIZE ? SAFE_TX_SIZE : (size - i);
             
             // Call the parent GsmClient write
             size_t sent = GsmClient::write(buf + i, chunk);
             totalWritten += sent;
             
-            // [CRITICAL FIX] If send failed (returned 0), connection is dead - abort immediately
-            if (sent == 0) {
-                DBG("write: Send failed (0 bytes) - aborting");
-                break;
-            }
-            
             // Feed watchdog
             #ifdef ESP32
             esp_task_wdt_reset();
             #endif
             
-            // [CRITICAL FIX] Minimal delay - fail fast on errors
-            delay(5); 
+            // CRITICAL DELAY: 100ms pause to let the modem clear its RAM
+            delay(100); 
             
             if (sent != chunk) break;
             yield(); 
@@ -1126,59 +1102,15 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
   }
 
   int16_t modemSend(const void* buff, size_t len, uint8_t mux) {
-    // [CRITICAL FIX] Very aggressive timeout - fail fast on dead connections
-    unsigned long sendStart = millis();
-    unsigned long sendMaxTime = 2000; // 2 seconds max TOTAL - healthy sends are <500ms
-    
     sendAT(GF("+CIPSEND="), mux, ',', (uint16_t)len);
-    // [CRITICAL FIX] 1s timeout for prompt - healthy connections respond in <100ms
-    if (waitResponse(1000L, GF(">")) != 1) { 
-      DBG("modemSend: No prompt - dead connection");
-      return 0;
-    }
-    
-    // Bail if already over time
-    if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Timeout after prompt wait");
-      return 0;
-    }
-    
+    if (waitResponse(GF(">")) != 1) { return 0; }
     stream.write(reinterpret_cast<const uint8_t*>(buff), len);
     stream.flush();
-    
-    // Bail if write took too long
-    if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Timeout after stream write");
-      return 0;
-    }
-    
-    // [CRITICAL FIX] 1s timeout for confirmation - healthy connections respond in <200ms
-    if (waitResponse(1000L, GF(GSM_NL "+CIPSEND:")) != 1) {
-      DBG("modemSend: No confirmation - dead connection");
-      return 0;
-    }
-    
-    // Final timeout check before parsing
-    if (millis() - sendStart > sendMaxTime) {
-      DBG("modemSend: Timeout before parsing");
-      return 0;
-    }
-    
-    // [CRITICAL FIX] Temporarily reduce Stream timeout to prevent blocking
-    // If modem is dead, these parsing functions will block for Stream timeout
-    // We need them to fail fast so we can return 0 and propagate error upward
-    unsigned long oldTimeout = stream.getTimeout();
-    stream.setTimeout(500); // 500ms max for parsing - healthy modem responds in <50ms
-    
+    if (waitResponse(GF(GSM_NL "+CIPSEND:")) != 1) { return 0; }
     streamSkipUntil(',');  // Skip mux
     streamSkipUntil(',');  // Skip requested bytes to send
     // TODO(?):  make sure requested and confirmed bytes match
-    int result = streamGetIntBefore('\n');
-    
-    // Restore original timeout
-    stream.setTimeout(oldTimeout);
-    
-    return result;
+    return streamGetIntBefore('\n');
   }
 
   // =================================================================
