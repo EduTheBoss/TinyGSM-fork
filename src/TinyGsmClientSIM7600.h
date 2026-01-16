@@ -269,7 +269,165 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
  public:
   explicit TinyGsmSim7600(Stream& stream) : stream(stream) {
     memset(sockets, 0, sizeof(sockets));
+    _lastTcpStackReset = 0;
+    _connectionCount = 0;
+    _failedConnectionCount = 0;
   }
+  
+  /*
+   * TCP Stack Health Management
+   * 
+   * The SIM7600 modem has an internal TCP/IP stack that accumulates
+   * state over time. After many connections (typically 100+) or after
+   * extended uptime (48h+), the stack becomes sluggish and connections
+   * fail or timeout. This is a known issue with these modems.
+   * 
+   * Solution: Periodically reset the TCP stack by closing and reopening
+   * the network connection (NETCLOSE + NETOPEN). This clears all internal
+   * socket state, buffer queues, and TCP timers.
+   */
+ public:
+  /**
+   * @brief Reset the modem's TCP/IP stack to clear accumulated state.
+   * 
+   * This performs a NETCLOSE/NETOPEN cycle which:
+   * - Closes all sockets and releases their resources
+   * - Clears TCP retransmission queues
+   * - Resets internal connection tracking
+   * - Reinitializes the IP stack
+   * 
+   * Should be called:
+   * - After a certain number of connections (e.g., every 50 connections)
+   * - Periodically (e.g., every 4-6 hours)
+   * - After multiple consecutive connection failures
+   * - Before critical operations after long uptime
+   * 
+   * @param apn The APN to reconnect with
+   * @param user APN username (optional)
+   * @param pwd APN password (optional)
+   * @return true if reset was successful
+   */
+  bool resetTcpStack(const char* apn, const char* user = NULL, const char* pwd = NULL) {
+    DBG("### Resetting TCP/IP Stack (clearing modem socket state)");
+    
+    // Feed watchdog before long operation
+    esp_task_wdt_reset();
+    
+    // Step 1: Close all individual sockets first (belt and suspenders)
+    for (int mux = 0; mux < TINY_GSM_MUX_COUNT; mux++) {
+      sendAT(GF("+CIPCLOSE="), mux);
+      waitResponse(5000L);  // Don't wait too long for each
+    }
+    
+    esp_task_wdt_reset();
+    
+    // Step 2: Close the network stack entirely
+    // This releases ALL modem TCP resources
+    sendAT(GF("+NETCLOSE"));
+    int8_t res = waitResponse(60000L, GF(GSM_NL "+NETCLOSE: 0"), GF(GSM_NL "+NETCLOSE: 2"));
+    // Result 0 = success, 2 = already closed (also OK)
+    if (res != 1 && res != 2) {
+      DBG("### NETCLOSE failed, forcing with AT reset sequence");
+      // Force close via TCP parameter reset
+      sendAT(GF("+CIPSHUT"));
+      waitResponse(5000L);
+    }
+    
+    esp_task_wdt_reset();
+    
+    // Step 3: Small delay to let modem fully release resources
+    delay(1000);
+    
+    // Step 4: Clear any buffered AT responses
+    while (stream.available()) { stream.read(); }
+    
+    // Step 5: Re-configure socket parameters (they may reset after NETCLOSE)
+    sendAT(GF("+CIPMODE=0"));  // Command mode
+    waitResponse();
+    
+    sendAT(GF("+CIPSENDMODE=0"));  // Normal send mode
+    waitResponse();
+    
+    sendAT(GF("+CIPRXGET=1"));  // Manual data retrieval
+    waitResponse();
+    
+    // Reduced timeouts to fail fast rather than hang
+    sendAT(GF("+CIPCCFG=10,0,0,0,1,0,15000"));  // 15s TCP timeout
+    waitResponse();
+    
+    sendAT(GF("+CIPTIMEOUT=15000,15000,15000"));  // 15s for all
+    waitResponse();
+    
+    esp_task_wdt_reset();
+    
+    // Step 6: Reopen the network
+    sendAT(GF("+NETOPEN"));
+    if (waitResponse(75000L, GF(GSM_NL "+NETOPEN: 0")) != 1) {
+      DBG("### NETOPEN failed after reset");
+      return false;
+    }
+    
+    // Step 7: Reset counters
+    _connectionCount = 0;
+    _failedConnectionCount = 0;
+    _lastTcpStackReset = millis();
+    
+    DBG("### TCP/IP Stack reset complete");
+    return true;
+  }
+  
+  /**
+   * @brief Check if TCP stack needs maintenance.
+   * 
+   * @return true if resetTcpStack() should be called
+   */
+  bool needsTcpStackReset() {
+    // Reset after every 50 connections
+    if (_connectionCount >= 50) {
+      DBG("### TCP stack reset needed: connection count threshold");
+      return true;
+    }
+    
+    // Reset after 3 consecutive failures
+    if (_failedConnectionCount >= 3) {
+      DBG("### TCP stack reset needed: multiple failures");
+      return true;
+    }
+    
+    // Reset every 4 hours regardless (preventive maintenance)
+    unsigned long fourHours = 4UL * 60UL * 60UL * 1000UL;
+    if (_lastTcpStackReset > 0 && (millis() - _lastTcpStackReset) > fourHours) {
+      DBG("### TCP stack reset needed: 4-hour maintenance interval");
+      return true;
+    }
+    
+    return false;
+  }
+  
+  /**
+   * @brief Increment connection counter (call on each new connection attempt)
+   */
+  void recordConnectionAttempt(bool success) {
+    _connectionCount++;
+    if (!success) {
+      _failedConnectionCount++;
+    } else {
+      _failedConnectionCount = 0;  // Reset on success
+    }
+  }
+  
+  /**
+   * @brief Get time since last TCP stack reset
+   */
+  unsigned long getTimeSinceTcpReset() {
+    if (_lastTcpStackReset == 0) return millis();  // Never reset
+    return millis() - _lastTcpStackReset;
+  }
+  
+ private:
+  unsigned long _lastTcpStackReset;
+  uint16_t _connectionCount;
+  uint8_t _failedConnectionCount;
 
   /*
    * Basic functions
