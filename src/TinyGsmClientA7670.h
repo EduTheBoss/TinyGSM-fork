@@ -261,6 +261,90 @@ class TinyGsmA7670 :  public TinyGsmA76xx<TinyGsmA7670>,
     return true;
   }
 
+  // [FIX] Proactive TCP stack flush - clears all modem TCP resources
+  // Call this periodically (every ~30-60 minutes) to prevent TCP state accumulation
+  // that causes SSL timeouts after long uptimes (the 10000s bug)
+  bool tcpStackFlush() {
+    DBG("### TCP Stack Flush - Clearing all modem TCP resources");
+    
+    // Step 1: Close all individual sockets first (prevents orphan states)
+    for (int mux = 0; mux < TINY_GSM_MUX_COUNT; mux++) {
+      sendAT(GF("+CIPCLOSE="), mux);
+      waitResponse(5000L); // Don't care if it fails (socket might not exist)
+    }
+    delay(500);
+    
+    // Step 2: Close the network stack entirely
+    sendAT(GF("+NETCLOSE"));
+    waitResponse(15000L, GF(GSM_NL "+NETCLOSE:")); // May return 0 (success) or error
+    delay(1000);
+    
+    // Step 3: Clear any pending UART data from modem
+    while (stream.available()) {
+      stream.read();
+    }
+    
+    // Step 4: Reopen network stack with fresh state
+    // Configure socket parameters again
+    sendAT(GF("+CIPMODE=0"));
+    waitResponse();
+    
+    sendAT(GF("+CIPSENDMODE=0"));
+    waitResponse();
+    
+    // [CRITICAL] Set reasonable timeouts to fail fast on issues
+    // RetryCount=10, Delay=0, Ack=0, ErrMode=0, HeaderType=1, AsyncMode=0, TimeoutVal=15000ms
+    sendAT(GF("+CIPCCFG=10,0,0,0,1,0,15000"));
+    waitResponse();
+    
+    sendAT(GF("+CIPTIMEOUT=15000,15000,15000"));
+    waitResponse();
+    
+    // Step 5: Reopen the network
+    sendAT(GF("+NETOPEN"));
+    if (waitResponse(30000L, GF(GSM_NL "+NETOPEN: 0")) != 1) {
+      DBG("### TCP Stack Flush - NETOPEN failed, retrying...");
+      delay(2000);
+      sendAT(GF("+NETOPEN"));
+      if (waitResponse(30000L, GF(GSM_NL "+NETOPEN: 0")) != 1) {
+        DBG("### TCP Stack Flush - NETOPEN failed after retry");
+        return false;
+      }
+    }
+    
+    DBG("### TCP Stack Flush - Complete, fresh TCP state");
+    return true;
+  }
+
+  // [FIX] Force close a specific socket at AT command level
+  // Use when SSL layer reports dead connection but socket may be stuck
+  bool forceCloseSocket(uint8_t mux) {
+    DBG("### Force closing socket", mux);
+    sendAT(GF("+CIPCLOSE="), mux);
+    int8_t result = waitResponse(5000L, GF(GSM_NL "+CIPCLOSE:"), GFP(GSM_ERROR));
+    if (result == 1) {
+      // Parse result: +CIPCLOSE: <mux>,<err>
+      streamSkipUntil(',');
+      int err = streamGetIntBefore('\n');
+      if (sockets[mux]) {
+        sockets[mux]->sock_connected = false;
+        sockets[mux]->sock_available = 0;
+      }
+      return (err == 0);
+    }
+    return false;
+  }
+
+  // [FIX] Check TCP stack health - returns true if healthy
+  bool isTcpStackHealthy() {
+    sendAT(GF("+NETOPEN?"));
+    if (waitResponse(5000L, GF(GSM_NL "+NETOPEN: 1")) == 1) {
+      waitResponse(); // consume OK
+      return true;
+    }
+    return false;
+  }
+
   bool isGprsConnectedImpl() {
     sendAT(GF("+NETOPEN?"));
     // May return +NETOPEN: 1, 0.  We just confirm that the first number is 1

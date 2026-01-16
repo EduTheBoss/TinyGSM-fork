@@ -27,15 +27,17 @@ enum GsmClientConnType { TINYGSM_TCP, TINYGSM_SSL, TINYGSM_WEBSOCKET };
 
 // Because of the ordering of resolution of overrides in templates, these need
 // to be written out every time.  This macro is to shorten that.
+// [FIX] Reduced default timeout from 75s to 15s for faster failure detection
+// This prevents long hangs when modem TCP is dead but reporting OK
 #define TINY_GSM_CLIENT_CONNECT_OVERRIDES                             \
   int connect(IPAddress ip, uint16_t port, int timeout_s) {           \
     return connect(TinyGsmStringFromIp(ip).c_str(), port, timeout_s); \
   }                                                                   \
   int connect(const char* host, uint16_t port) override {             \
-    return connect(host, port, 75);                                   \
+    return connect(host, port, 15);                                   \
   }                                                                   \
   int connect(IPAddress ip, uint16_t port) override {                 \
-    return connect(ip, port, 75);                                     \
+    return connect(ip, port, 15);                                     \
   }
 
 // For modules that do not store incoming data in any sort of buffer
