@@ -1260,15 +1260,28 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
   }
 
   int16_t modemSend(const void* buff, size_t len, uint8_t mux) {
+    // [DIAGNOSTIC] Log uptime for 10000s debugging
+    DBG("### modemSend: len=", len, " mux=", mux, " uptime=", millis()/1000, "s");
+    
     sendAT(GF("+CIPSEND="), mux, ',', (uint16_t)len);
-    if (waitResponse(GF(">")) != 1) { return 0; }
+    int8_t resp = waitResponse(GF(">"));
+    if (resp != 1) { 
+      DBG("### modemSend FAILED: waitResponse for '>' returned ", resp, " at uptime ", millis()/1000, "s");
+      return 0; 
+    }
     stream.write(reinterpret_cast<const uint8_t*>(buff), len);
     stream.flush();
-    if (waitResponse(GF(GSM_NL "+CIPSEND:")) != 1) { return 0; }
+    resp = waitResponse(GF(GSM_NL "+CIPSEND:"));
+    if (resp != 1) { 
+      DBG("### modemSend FAILED: waitResponse for '+CIPSEND:' returned ", resp, " at uptime ", millis()/1000, "s");
+      return 0; 
+    }
     streamSkipUntil(',');  // Skip mux
     streamSkipUntil(',');  // Skip requested bytes to send
     // TODO(?):  make sure requested and confirmed bytes match
-    return streamGetIntBefore('\n');
+    int16_t confirmed = streamGetIntBefore('\n');
+    DBG("### modemSend OK: confirmed=", confirmed, " bytes");
+    return confirmed;
   }
 
   // =================================================================
