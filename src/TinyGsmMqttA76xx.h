@@ -101,13 +101,24 @@ public:
         will_qos = qos;
     }
 
+    // cleanSession:    0 = persistent session (broker buffers QoS1 messages for
+    //                      this clientID while we're offline; redelivers on
+    //                      reconnect with the same clientID + cleanSession=0).
+    //                  1 = clean session (default, original library behaviour).
+    // skipCertUpload:  true = skip the CCERTDOWN block (certs persist in modem
+    //                      flash across reboots, so re-uploading every connect
+    //                      adds ~750ms of UART traffic for no benefit).
+    //                      Authmode + SSL config are still applied so the
+    //                      stack stays consistent.
     bool mqtt_connect(
         uint8_t clientIndex,
         const char *server, uint16_t port,
         const char *clientID,
         const char *username = NULL,
         const char *password = NULL,
-        uint32_t keepalive_time = 60)
+        uint32_t keepalive_time = 60,
+        uint8_t cleanSession = 1,
+        bool skipCertUpload = false)
     {
         uint8_t authMethod = 0;
 
@@ -116,7 +127,7 @@ public:
         }
 
         if (this->cert_pem || this->client_cert_pem || this->client_key_pem) {
-            if (this->cert_pem) {
+            if (this->cert_pem && !skipCertUpload) {
                 thisModem().sendAT("+CCERTDOWN=\"ca_cert.pem\",", strlen(this->cert_pem));
                 if (thisModem().waitResponse(10000UL, ">") == 1) {
                     thisModem().stream.write(this->cert_pem);
@@ -129,7 +140,7 @@ public:
                 thisModem().waitResponse();
 
             }
-            if (this->client_cert_pem) {
+            if (this->client_cert_pem && !skipCertUpload) {
                 thisModem().sendAT("+CCERTDOWN=\"cert.pem\",", strlen(this->client_cert_pem));
                 if (thisModem().waitResponse(10000UL, ">") == 1) {
                     thisModem().stream.write(this->client_cert_pem);
@@ -142,7 +153,7 @@ public:
                 thisModem().waitResponse();
 
             }
-            if (this->client_key_pem) {
+            if (this->client_key_pem && !skipCertUpload) {
                 thisModem().sendAT("+CCERTDOWN=\"key_cert.pem\",", strlen(this->client_key_pem));
                 if (thisModem().waitResponse(10000UL, ">") == 1) {
                     thisModem().stream.write(this->client_key_pem);
@@ -207,10 +218,13 @@ public:
             }
         }
 
+        // cleanSession is the 4th positional arg to AT+CMQTTCONNECT.
+        // 0 = persistent (broker stores session state + queued QoS1 msgs).
+        // 1 = clean      (broker discards prior state — historical default).
         if (username && password) {
-            thisModem().sendAT("+CMQTTCONNECT=", clientIndex, ',', "\"tcp://", server, ':', port, "\",", keepalive_time, ',', 1, ",\"", username, "\",\"", password, "\"");
+            thisModem().sendAT("+CMQTTCONNECT=", clientIndex, ',', "\"tcp://", server, ':', port, "\",", keepalive_time, ',', cleanSession, ",\"", username, "\",\"", password, "\"");
         } else {
-            thisModem().sendAT("+CMQTTCONNECT=", clientIndex, ',', "\"tcp://", server, ':', port, "\",", keepalive_time, ',', 1);
+            thisModem().sendAT("+CMQTTCONNECT=", clientIndex, ',', "\"tcp://", server, ':', port, "\",", keepalive_time, ',', cleanSession);
         }
         if (thisModem().waitResponse(30000UL) != 1)return false;
 
